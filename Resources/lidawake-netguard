@@ -1,0 +1,258 @@
+#!/bin/bash
+# lidawake-netguard — lidawake 켜진 동안 인터넷이 죽으면 아이폰 핫스팟으로 넘긴다.
+# 사용자 LaunchAgent 가 15초마다 `run` 으로 1회 실행. lidawake 가 꺼져 있으면 아무것도 안 한다.
+# 단 netguard-always 파일이 1이면 lidawake 와 상관없이 늘 감시한다.
+#
+# 끊긴 뒤 경과 시간 기준 (복구 시도 = 핫스팟 직접 접속, 핫스팟이 안 잡히면 바로 Wi-Fi 껐다 켜기):
+#   40초   첫 복구 시도. Wi-Fi 재시작 때 macOS가 다른 알려진 네트워크를 고른다
+#          ("핫스팟 연결 요청: 자동"도 여기서 발동)
+#   +50초  두 번째 복구 시도
+#   이후   150초 쉬고 복구 시도 → 50초 뒤 복구 시도, 반복
+#
+# 동의·로그인 화면이 뜨는 와이파이(카페·공공 와이파이)에서는 Wi-Fi 재시작을 하지 않는다.
+#   재시작하면 그 화면이 닫혀 동의를 못 한다. 알림만 한 번 띄우고,
+#   뚜껑이 닫혀 누를 사람이 없을 때만 핫스팟 접속을 시도한다.
+#
+# 사용: lidawake-netguard          상태
+#      lidawake-netguard check    인터넷 확인 1회 (아무것도 안 바꿈)
+#      lidawake-netguard run      감시 1틱 (launchd 가 부름)
+#
+# 테스트용 환경변수: NETGUARD_DRYRUN=1(실제 조작 X, 로그만) NETGUARD_FORCE_FAIL=1(오프라인 가정)
+#                  NETGUARD_FORCE_CAPTIVE=1(동의 화면 가정) NETGUARD_TEST_LID=open|closed NETGUARD_TEST_SSID=<이름>
+#                  NETGUARD_NOW=<epoch> LIDAWAKE_STATE / NETGUARD_ALWAYS_FILE / NETGUARD_STATE / NETGUARD_LOG 경로 바꾸기
+set -uo pipefail
+# Awake owns this switch; an in-flight Wi-Fi restart is allowed to finish.
+ENABLED_FILE=${NETGUARD_ENABLED_FILE:-$HOME/Library/Application Support/Awake/netguard-enabled}
+if [ -f "$ENABLED_FILE" ] && [ "$(cat "$ENABLED_FILE")" != "1" ]; then
+  exit 0
+fi
+
+LABEL=io.theplato.paul.lidawake-netguard
+LIDAWAKE_STATE=${LIDAWAKE_STATE:-/var/run/lidawake.state}
+ALWAYS_FILE=${NETGUARD_ALWAYS_FILE:-$HOME/Library/Application Support/Awake/netguard-always}
+CONF=${NETGUARD_CONF:-$HOME/.config/lidawake/netguard.conf}
+STATE=${NETGUARD_STATE:-$HOME/Library/Caches/lidawake-netguard.state}
+LOG=${NETGUARD_LOG:-$HOME/Library/Logs/lidawake-netguard.log}
+DRYRUN=${NETGUARD_DRYRUN:-0}
+FORCE_FAIL=${NETGUARD_FORCE_FAIL:-0}
+
+HOTSPOT_SSID=""
+HOTSPOT_PASSWORD=""
+# shellcheck disable=SC1090
+[ -f "$CONF" ] && . "$CONF"
+AWAKE_CONF=${AWAKE_HOTSPOT_CONFIG:-$HOME/Library/Application Support/Awake/hotspot.json}
+USE_KEYCHAIN=0
+if [ -f "$AWAKE_CONF" ]; then
+  HOTSPOT_SSID=$(/usr/bin/plutil -extract ssid raw -o - "$AWAKE_CONF" 2>/dev/null) || HOTSPOT_SSID=""
+  HOTSPOT_PASSWORD=""
+  [ "$(/usr/bin/plutil -extract usesKeychain raw -o - "$AWAKE_CONF" 2>/dev/null)" != true ] || USE_KEYCHAIN=1
+fi
+
+# An unanswered keychain/network command must not block every future launchd tick.
+# exec preserves the POSIX alarm; arguments (including SSIDs) are never evaluated.
+bounded() { local seconds=$1; shift; /usr/bin/perl -e 'alarm shift; exec @ARGV or exit 127' "$seconds" "$@"; }
+
+IFACE=$(bounded 5 networksetup -listallhardwareports 2>/dev/null | awk '/Hardware Port: Wi-Fi/{getline; print $2; exit}')
+IFACE=${IFACE:-en0}
+
+FIRST_ACTION=40     # 끊긴 뒤 첫 복구 시도까지
+REJOIN_GAP=50       # 복구 시도 직후 다음 시도까지
+REPEAT_GAP=150      # 두 번 연달아 시도한 뒤 쉬는 시간
+STALE_GAP=120       # 틱 사이가 이보다 벌어지면 (맥이 잤다 깼다) 새로 센다
+
+now_s()  { echo "${NETGUARD_NOW:-$(date +%s)}"; }
+log()    { mkdir -p "$(dirname "$LOG")"; printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >>"$LOG"; }
+# 와이파이 이름은 남이 정하는 값이라 AppleScript 본문에 끼우지 않고 인자로만 넘긴다.
+notify() { [ "$DRYRUN" = 1 ] && return 0; /usr/bin/osascript -e 'on run argv' -e 'display notification (item 2 of argv) with title (item 1 of argv)' -e 'end run' "$1" "$2" >/dev/null 2>&1 || true; }
+
+lidawake_active() {
+  [ -f "$LIDAWAKE_STATE" ] || return 1
+  local expiry; expiry=$(sed -n 's/^expiry=//p' "$LIDAWAKE_STATE")
+  case "$expiry" in ''|*[!0-9]*) return 1 ;; esac
+  [ "$(now_s)" -lt "$expiry" ]
+}
+always_on() { [ -f "$ALWAYS_FILE" ] && [ "$(cat "$ALWAYS_FILE")" = 1 ]; }
+watching()  { lidawake_active || always_on; }
+# 아이폰 개인용 핫스팟은 게이트웨이가 늘 172.20.10.1
+on_hotspot() { [ "$(bounded 5 ipconfig getoption "$IFACE" router 2>/dev/null)" = 172.20.10.1 ]; }
+
+# online · captive(와이파이엔 붙었는데 동의·로그인 화면이 대신 답함) · offline
+net_state() {
+  [ "${NETGUARD_FORCE_CAPTIVE:-0}" = 1 ] && { echo captive; return; }
+  [ "$FORCE_FAIL" = 1 ] && { echo offline; return; }
+  local body code
+  body=$(curl -s -m 5 http://captive.apple.com/hotspot-detect.html 2>/dev/null)
+  case "$body" in *Success*) echo online; return ;; esac
+  code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://connectivitycheck.gstatic.com/generate_204 2>/dev/null)
+  [ "$code" = 204 ] && { echo online; return; }
+  # 답은 왔는데 정답이 아니면 중간에서 다른 페이지가 가로챈 것
+  if [ -n "$body" ] || { [ -n "$code" ] && [ "$code" != 000 ]; }; then echo captive; else echo offline; fi
+}
+online() { [ "$(net_state)" = online ]; }
+
+lid_closed() {
+  case "${NETGUARD_TEST_LID:-}" in closed) return 0 ;; open) return 1 ;; esac
+  bounded 5 ioreg -r -k AppleClamshellState -d 4 2>/dev/null | grep -q '"AppleClamshellState" = Yes'
+}
+
+# macOS 26은 SSID를 <redacted>로 가린다. scutil 의 마지막 스캔 기록(키 아카이브)에서 꺼낸다. 못 읽으면 빈 값.
+current_ssid() {
+  if [ -n "${NETGUARD_TEST_SSID+x}" ]; then printf '%s' "$NETGUARD_TEST_SSID"; return; fi
+  local py hex
+  # /usr/bin/python3 는 개발 도구가 없으면 설치 창을 띄우므로 실제 경로만 쓴다
+  py="$(xcode-select -p 2>/dev/null)/usr/bin/python3"
+  [ -x "$py" ] || return 0
+  hex=$(echo "show State:/Network/Interface/$IFACE/AirPort" | bounded 5 scutil 2>/dev/null | sed -n 's/^ *CachedScanRecord : <data> 0x//p')
+  [ -n "$hex" ] || return 0
+  bounded 5 "$py" -I -c '
+import plistlib, sys
+o = plistlib.loads(bytes.fromhex(sys.argv[1]))["$objects"]
+for x in o:
+    if isinstance(x, dict) and "NS.keys" in x:
+        keys = [o[k.data] for k in x["NS.keys"]]
+        if "SSID_STR" in keys:
+            print(o[x["NS.objects"][keys.index("SSID_STR")].data]); break
+' "$hex" 2>/dev/null
+}
+
+wifi_power_on() { [ "$DRYRUN" = 1 ] && [ "${NETGUARD_TEST_WIFI_ON:-0}" = 1 ] && return 0; bounded 5 networksetup -getairportpower "$IFACE" 2>/dev/null | grep -q ': On$'; }
+
+# --- 상태 파일: 끊김 시작 시각 · 단계 · 마지막 조작 시각 · 마지막 틱 시각 · 동의 화면 알림 여부 ---
+num() { case "$1" in ''|*[!0-9]*) echo 0 ;; *) echo "$1" ;; esac; }
+load() {
+  since=0; stage=0; last_act=0; last_tick=0; captive=0
+  [ -f "$STATE" ] || return 0
+  since=$(num "$(sed -n 's/^since=//p' "$STATE")")
+  stage=$(num "$(sed -n 's/^stage=//p' "$STATE")")
+  last_act=$(num "$(sed -n 's/^last_act=//p' "$STATE")")
+  last_tick=$(num "$(sed -n 's/^last_tick=//p' "$STATE")")
+  captive=$(num "$(sed -n 's/^captive=//p' "$STATE")")
+}
+save()  { mkdir -p "$(dirname "$STATE")"; printf 'since=%s\nstage=%s\nlast_act=%s\nlast_tick=%s\ncaptive=%s\n' "$since" "$stage" "$last_act" "$last_tick" "$captive" >"$STATE"; }
+reset() { rm -f "$STATE"; }
+
+cycle_wifi() {
+  log "  → Wi-Fi 재시작 ($IFACE) — macOS가 네트워크를 다시 고르게 함"
+  if [ "$DRYRUN" = 1 ]; then log "    (dry-run) setairportpower off/on"; return; fi
+  bounded 8 networksetup -setairportpower "$IFACE" off >/dev/null 2>&1
+  sleep 3
+  bounded 8 networksetup -setairportpower "$IFACE" on >/dev/null 2>&1
+  if ! wifi_power_on; then sleep 2; bounded 8 networksetup -setairportpower "$IFACE" on >/dev/null 2>&1; fi
+  wifi_power_on || log "    ⚠️ Wi-Fi 다시 켜기 실패 — 직접 켜야 함"
+}
+
+# 접속 명령이 오류 없이 끝났을 때만 0. networksetup 은 실패해도 종료 코드 0이라 출력으로 판정한다.
+join_hotspot() {
+  [ -n "$HOTSPOT_SSID" ] || return 1
+  log "  → 핫스팟 직접 접속 시도: $HOTSPOT_SSID"
+  if [ "$DRYRUN" = 1 ]; then log "    (dry-run) setairportnetwork"; return 1; fi
+  if on_hotspot; then log "    이미 핫스팟에 붙어 있음 — 건너뜀"; return 1; fi
+  if [ "$USE_KEYCHAIN" = 1 ]; then
+    HOTSPOT_PASSWORD=$(bounded 8 "$HOME/Library/Application Support/Awake/awake-credentials" get "$HOTSPOT_SSID" 2>/dev/null) || {
+      log "    키체인 암호를 읽지 못함 — Awake 설정에서 핫스팟을 다시 저장해 주세요"; return 1;
+    }
+  fi
+  local out status
+  if [ -n "$HOTSPOT_PASSWORD" ]; then
+    out=$(bounded 25 networksetup -setairportnetwork "$IFACE" "$HOTSPOT_SSID" "$HOTSPOT_PASSWORD" 2>&1)
+  else
+    out=$(bounded 25 networksetup -setairportnetwork "$IFACE" "$HOTSPOT_SSID" 2>&1)
+  fi
+  status=$?
+  if [ "$status" -eq 142 ]; then
+    log "    접속 응답 25초 초과 — 중단 후 다음 감시에서 재시도"; return 1
+  elif [ -n "$out" ]; then
+    log "    networksetup: $out"; return 1
+  fi
+  [ "$status" -eq 0 ]
+}
+
+# 핫스팟 우선. 안 잡히면 같은 틱에 Wi-Fi 재시작으로 넘어간다.
+recover() { join_hotspot || cycle_wifi; }
+
+tick() {
+  [ -n "$HOTSPOT_SSID" ] || return 0
+  local now; now=$(now_s)
+  load
+
+  if ! watching; then reset; return 0; fi
+  if ! wifi_power_on; then
+    if [ "$stage" -gt 0 ] && [ "$DRYRUN" != 1 ]; then
+      # 감시자가 껐다가 못 켠 경우 — 다시 켠다
+      bounded 8 networksetup -setairportpower "$IFACE" on >/dev/null 2>&1
+      log "  → 꺼진 채 남은 Wi-Fi 다시 켜기"
+    else
+      # 사용자가 Wi-Fi 를 직접 꺼둔 거면 건드리지 않는다
+      reset; return 0
+    fi
+  fi
+
+  local net ssid; net=$(net_state)
+  if [ "$net" = online ]; then
+    if [ "$stage" -gt 0 ]; then
+      ssid=$(current_ssid)
+      log "✅ 복구 — 인터넷 다시 됨 (끊긴 지 $(( now - since ))초${ssid:+, $ssid})"
+      notify "lidawake-netguard" "인터넷 복구 ($(( now - since ))초 끊김${ssid:+, $ssid})"
+    elif [ "$captive" -eq 1 ]; then
+      log "✅ 동의·로그인 화면 통과 — 인터넷 됨 ($(( now - since ))초)"
+    elif [ "$since" -gt 0 ]; then
+      log "✅ 조작 없이 저절로 복구 ($(( now - since ))초 끊김)"
+    fi
+    reset; return 0
+  fi
+
+  # 오프라인 또는 동의 화면
+  if [ "$since" -eq 0 ] || [ $(( now - last_tick )) -gt "$STALE_GAP" ]; then
+    since=$now; stage=0; last_act=0; captive=0
+    log "인터넷 응답 없음 — 감시 시작 ($(lidawake_active && echo 'lidawake 켜짐' || echo '상시 감시'))"
+  fi
+  last_tick=$now
+  local elapsed=$(( now - since )) action=recover
+
+  if [ "$net" = captive ]; then
+    if [ "$captive" -eq 0 ]; then
+      captive=1; ssid=$(current_ssid)
+      log "  동의·로그인 화면이 있는 와이파이${ssid:+ ($ssid)} — Wi-Fi 재시작 안 함"
+      notify "lidawake-netguard" "${ssid:+$ssid }와이파이에 동의·로그인 화면이 있어요. 브라우저에서 확인해 주세요."
+    fi
+    # Wi-Fi 재시작은 동의 화면을 닫아버린다. 뚜껑이 닫혀 누를 사람이 없을 때만 핫스팟으로 옮긴다.
+    if lid_closed; then action=join_hotspot; else save; return 0; fi
+  fi
+
+  if [ "$stage" -eq 0 ] && [ "$elapsed" -ge "$FIRST_ACTION" ]; then
+    log "${elapsed}초째 끊김"; $action; stage=1; last_act=$now
+  elif [ "$stage" -eq 1 ] && [ $(( now - last_act )) -ge "$REJOIN_GAP" ]; then
+    log "${elapsed}초째 끊김"; $action; stage=2; last_act=$now
+  elif [ "$stage" -eq 2 ] && [ $(( now - last_act )) -ge "$REPEAT_GAP" ]; then
+    log "${elapsed}초째 끊김 — 재시도"; $action; stage=1; last_act=$now
+  fi
+  save
+}
+
+show_status() {
+  if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+    echo "🛰  감시자 실행 중 (15초 간격)"
+  else
+    echo "⚠️  감시자 등록 안 됨 — ~/Tools/lidawake/netguard-install.sh"
+  fi
+  if lidawake_active; then echo "   lidawake 켜짐 → 감시 중"
+  elif always_on; then echo "   상시 감시 켜짐 → 감시 중"
+  else echo "   lidawake 꺼짐 → 대기 (아무것도 안 함)"; fi
+  case "$(net_state)" in
+    online) echo "   인터넷 됨" ;;
+    captive) echo "   와이파이엔 붙었지만 동의·로그인 화면이 막고 있음" ;;
+    *) echo "   인터넷 안 됨" ;;
+  esac
+  printf '   핫스팟 %s (직접 접속 비번 %s)\n' "$HOTSPOT_SSID" "$([ -n "$HOTSPOT_PASSWORD" ] && echo '설정됨' || echo '없음')"
+  load
+  if [ "$since" -gt 0 ]; then printf '   끊김 진행 중: %s초째, 단계 %s\n' "$(( $(now_s) - since ))" "$stage"; fi
+  if [ -s "$LOG" ]; then echo "   최근 로그:"; tail -5 "$LOG" | sed 's/^/     /'; fi
+}
+
+case "${1:-status}" in
+  run) tick ;;
+  check) if online; then echo "인터넷 됨"; else echo "인터넷 안 됨"; exit 1; fi ;;
+  status|"") show_status ;;
+  -h|--help|help) sed -n '2,22p' "$0" | sed 's/^# \{0,1\}//' ;;
+  *) echo "모르는 명령: $1 (status | check | run)" >&2; exit 1 ;;
+esac

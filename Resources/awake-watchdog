@@ -1,0 +1,63 @@
+#!/bin/bash
+# lidawake-watchdog — 1분마다 돌며 disablesleep 을 강제로 회수한다.
+# 해제 조건: 시간 만료 / 배터리 하한 / 재부팅 / 만료 기록 없는 고아 상태
+set -uo pipefail
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+
+STATE=/var/run/lidawake.state
+LOG=/Library/Logs/lidawake.log
+
+boot_epoch() { sysctl -n kern.boottime | sed -n 's/[^0-9]*\([0-9][0-9]*\).*/\1/p'; }
+batt_pct()   { pmset -g batt | grep -Eo '[0-9]+%' | head -1 | tr -d '%'; }
+on_ac()      { pmset -g batt | head -1 | grep -q "AC Power"; }
+is_on()      { { pmset -g custom; pmset -g; } 2>/dev/null | grep -qE '^[[:space:]]*disablesleep[[:space:]]+1'; }
+log()        { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" >>"$LOG" 2>/dev/null; }
+
+notify() {
+  local title="$1" msg="$2" uid
+  uid=$(stat -f %u /dev/console 2>/dev/null)
+  [ -n "$uid" ] && [ "$uid" != "0" ] || return 0
+  launchctl asuser "$uid" /usr/bin/osascript \
+    -e "display notification \"$msg\" with title \"$title\" sound name \"Submarine\"" >/dev/null 2>&1
+}
+
+release() {
+  local why="$1"
+  pmset -a disablesleep 0 >/dev/null 2>&1
+  rm -f "$STATE"
+  log "자동 해제 — $why"
+  notify "lidawake 해제" "$why · 이제 뚜껑 닫으면 잠듭니다"
+}
+
+if [ ! -f "$STATE" ]; then
+  if is_on; then release "만료 기록 없는 켜짐 상태 회수"; fi
+  exit 0
+fi
+
+expiry=$(sed -n 's/^expiry=//p' "$STATE")
+boot=$(sed -n 's/^boot=//p' "$STATE")
+floor=$(sed -n 's/^floor=//p' "$STATE")
+warned=$(sed -n 's/^warned=//p' "$STATE")
+now=$(date +%s)
+
+case "$expiry" in ''|*[!0-9]*) release "상태 파일 손상"; exit 0 ;; esac
+
+if [ "$boot" != "$(boot_epoch)" ]; then release "재부팅 감지"; exit 0; fi
+if [ "$now" -ge "$expiry" ]; then release "설정한 시간 만료"; exit 0; fi
+
+pct=$(batt_pct)
+if ! on_ac && [ -n "$pct" ] && [ -n "$floor" ] && [ "$pct" -lt "$floor" ]; then
+  release "배터리 ${pct}% (하한 ${floor}%)"
+  exit 0
+fi
+
+# 만료 5분 전 예고
+left=$(( expiry - now ))
+if [ "$left" -le 300 ] && [ "${warned:-0}" != "1" ]; then
+  notify "lidawake 곧 해제" "$(( (left + 59) / 60 ))분 뒤 자동 해제됩니다"
+  sed -i '' 's/^warned=.*/warned=1/' "$STATE" 2>/dev/null
+fi
+
+# 상태 파일은 살아있는데 누가 꺼버렸으면 다시 켜지는 않는다 (사용자 의사 존중)
+exit 0

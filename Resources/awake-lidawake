@@ -1,0 +1,37 @@
+#!/bin/bash
+# Fixed-purpose privileged helper. Its parent directory is root-owned.
+set -euo pipefail
+PATH=/usr/bin:/bin:/usr/sbin:/sbin
+export PATH
+STATE=/var/run/lidawake.state
+LOG=/Library/Logs/lidawake.log
+SELF='/Library/Application Support/Awake/lidawake'
+
+fail() { echo '시간은 1~480분, 배터리 기준은 20/30/40%입니다.' >&2; exit 2; }
+case "${1:-}" in
+  off) [ "$#" -eq 1 ] || fail ;;
+  *)
+    [ "$#" -eq 3 ] || fail
+    case "$1" in ''|*[!0-9]*|0*) fail ;; esac
+    [ "${#1}" -le 3 ] && [ "$1" -ge 1 ] && [ "$1" -le 480 ] || fail
+    case "$2" in 20|30|40) ;; *) fail ;; esac
+    [ "$3" = -a ] || fail
+    ;;
+esac
+[ "$EUID" -eq 0 ] || exec /usr/bin/sudo -n "$SELF" "$@"
+if [ "$1" = off ]; then
+  /usr/bin/pmset -a disablesleep 0
+  /bin/rm -f "$STATE"
+  printf '[%s] 해제 (Awake)\n' "$(date '+%Y-%m-%d %H:%M:%S')" >> "$LOG"
+else
+  expiry=$(( $(date +%s) + $1 * 60 ))
+  boot=$(/usr/sbin/sysctl -n kern.boottime | sed -n 's/[^0-9]*\([0-9][0-9]*\).*/\1/p')
+  # Publish the expiry first so a watchdog never sees an unbounded awake session.
+  tmp=$(/usr/bin/mktemp /var/run/awake-lidawake.XXXXXX)
+  trap '/bin/rm -f "$tmp"' EXIT
+  printf 'expiry=%s\nboot=%s\nfloor=%s\nscope=-a\nwarned=0\n' "$expiry" "$boot" "$2" > "$tmp"
+  chmod 644 "$tmp"
+  mv -f "$tmp" "$STATE"
+  /usr/bin/pmset -a disablesleep 1
+  printf '[%s] 설정 %s분 (하한 %s%%, scope -a, Awake)\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1" "$2" >> "$LOG"
+fi

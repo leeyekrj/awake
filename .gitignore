@@ -1,0 +1,12 @@
+build/
+dist/
+research/
+preview/
+.taste-skill/
+.impeccable/
+.DS_Store
+__pycache__/
+*.pyc
+.env*
+*.pem
+*.p12
